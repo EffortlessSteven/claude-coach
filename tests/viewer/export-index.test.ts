@@ -1,10 +1,38 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
+import JSZip from "jszip";
 import {
   sanitizeFilename,
   getAvailableFormats,
   downloadFile,
+  exportAllWorkouts,
 } from "../../src/viewer/lib/export/index.js";
-import type { Sport } from "../../src/schema/training-plan.js";
+import type { Sport, TrainingPlan, Workout } from "../../src/schema/training-plan.js";
+import type { Settings } from "../../src/viewer/stores/settings.js";
+
+const bulkSettings = {} as Settings;
+
+function bulkWorkout(id: string, description: string): Workout {
+  return {
+    id,
+    sport: "run",
+    type: "endurance",
+    name: "Easy Run",
+    description,
+    durationMinutes: 30,
+    completed: false,
+  };
+}
+
+function bulkPlan(days: Array<{ date: string; workouts: Workout[] }>): TrainingPlan {
+  return {
+    meta: { id: "bulk-plan", event: "Test Event" },
+    weeks: [
+      {
+        days: days.map((day) => ({ ...day, dayOfWeek: "Monday" })),
+      },
+    ],
+  } as unknown as TrainingPlan;
+}
 
 describe("sanitizeFilename", () => {
   it("should remove invalid characters", () => {
@@ -29,10 +57,26 @@ describe("sanitizeFilename", () => {
     expect(sanitizeFilename("word1  word2   word3")).toBe("word1_word2_word3");
   });
 
+  it("should remove control characters while preserving whitespace separators", () => {
+    expect(sanitizeFilename("safe\u0000\u0007 name\u007f")).toBe("safe_name");
+    expect(sanitizeFilename("line\nbreak\tname")).toBe("line_break_name");
+  });
+
   it("should limit length to 100 characters", () => {
     const longName = "a".repeat(150);
     expect(sanitizeFilename(longName)).toHaveLength(100);
     expect(sanitizeFilename(longName)).toBe("a".repeat(100));
+  });
+
+  it("should not split a surrogate pair at the length boundary", () => {
+    const result = sanitizeFilename("a".repeat(99) + "😀");
+    expect(result).toBe("a".repeat(99));
+    expect(result).not.toContain("�");
+  });
+
+  it("should replace unmatched surrogates before filename serialization", () => {
+    expect(sanitizeFilename("a\ud800b")).toBe("a�b");
+    expect(sanitizeFilename("a\udc00b")).toBe("a�b");
   });
 
   it("should handle names at exactly 100 characters", () => {
@@ -131,7 +175,6 @@ describe("downloadFile", () => {
     mockCreateObjectURL = vi.fn().mockReturnValue("blob:test-url");
     mockRevokeObjectURL = vi.fn();
 
-    // Mock document
     vi.stubGlobal("document", {
       createElement: mockCreateElement,
       body: {
@@ -140,7 +183,6 @@ describe("downloadFile", () => {
       },
     });
 
-    // Mock URL
     vi.stubGlobal("URL", {
       createObjectURL: mockCreateObjectURL,
       revokeObjectURL: mockRevokeObjectURL,
@@ -203,6 +245,45 @@ describe("downloadFile", () => {
     const blobArg = mockCreateObjectURL.mock.calls[0][0];
     expect(blobArg.type).toBe("application/xml");
     expect(mockLink.download).toBe("workout.zwo");
+  });
+
+  it("should preserve repeated names through the public bulk-export API", async () => {
+    let downloadedBlob: Blob | undefined;
+    mockCreateObjectURL.mockImplementation((blob: Blob) => {
+      downloadedBlob = blob;
+      return "blob:bulk-export";
+    });
+    const source = bulkPlan([
+      { date: "2025-01-06", workouts: [bulkWorkout("first", "first workout")] },
+      { date: "2025-01-08", workouts: [bulkWorkout("second", "second workout")] },
+    ]);
+
+    const result = await exportAllWorkouts(source, "zwo", bulkSettings);
+    expect(result).toEqual({ exported: 2, skipped: 0, errors: [] });
+    if (!downloadedBlob) throw new Error("Expected the bulk export to download a ZIP");
+
+    const zip = await JSZip.loadAsync(new Uint8Array(await downloadedBlob.arrayBuffer()));
+    const files = Object.values(zip.files).filter((entry) => !entry.dir);
+    expect(files.map((entry) => entry.name)).toEqual([
+      "2025-01-06_Easy_Run.zwo",
+      "2025-01-08_Easy_Run.zwo",
+    ]);
+    expect(await files[0].async("string")).toContain("first workout");
+    expect(await files[1].async("string")).toContain("second workout");
+  });
+
+  it("should not report successful exports when the browser download fails", async () => {
+    mockCreateObjectURL.mockImplementation(() => {
+      throw new Error("download failed");
+    });
+    const source = bulkPlan([
+      { date: "2025-01-06", workouts: [bulkWorkout("first", "first workout")] },
+    ]);
+
+    const result = await exportAllWorkouts(source, "zwo", bulkSettings);
+    expect(result.exported).toBe(0);
+    expect(result.skipped).toBe(0);
+    expect(result.errors).toEqual(["Could not create workout ZIP: download failed"]);
   });
 
   it("should call operations in correct order", () => {

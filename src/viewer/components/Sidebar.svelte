@@ -3,6 +3,7 @@
   import type { Settings } from "../stores/settings.js";
   import { formatEventDate, getDaysToEvent, getSportIcon } from "../lib/utils.js";
   import { exportPlanToCalendar, exportAllWorkouts } from "../lib/export/index.js";
+  import type { WorkoutExportFormat } from "../lib/export/archive.js";
 
   interface Props {
     plan: TrainingPlan;
@@ -107,7 +108,7 @@
     }, 3000);
   }
 
-  async function handleExportAllWorkouts(format: "zwo" | "fit") {
+  async function handleExportAllWorkouts(format: WorkoutExportFormat) {
     showExportMenu = false;
     exportStatus = { message: `Exporting ${format.toUpperCase()} files...`, isError: false };
 

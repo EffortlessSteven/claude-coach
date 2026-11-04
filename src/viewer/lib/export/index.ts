@@ -15,7 +15,8 @@ import { generateZwo, isZwoSupported } from "./zwo.js";
 import { generateFit, isFitSupported } from "./fit.js";
 import { generateMrc, isErgSupported } from "./erg.js";
 import { generateIcs } from "./ics.js";
-import JSZip from "jszip";
+import { sanitizeFilename } from "./filename.js";
+import { buildWorkoutArchive, type WorkoutExportFormat } from "./archive.js";
 
 export type ExportFormat = "zwo" | "fit" | "mrc" | "ics";
 
@@ -46,16 +47,6 @@ export function downloadFile(
   link.click();
   document.body.removeChild(link);
   URL.revokeObjectURL(url);
-}
-
-/**
- * Sanitize filename to be safe across platforms
- */
-export function sanitizeFilename(name: string): string {
-  return name
-    .replace(/[<>:"/\\|?*]/g, "") // Remove invalid chars
-    .replace(/\s+/g, "_") // Replace spaces with underscores
-    .substring(0, 100); // Limit length
 }
 
 /**
@@ -169,107 +160,29 @@ export function exportPlanToCalendar(plan: TrainingPlan): ExportResult {
 }
 
 /**
- * Generate workout file content without triggering a download
- */
-async function generateWorkoutContent(
-  workout: Workout,
-  format: "zwo" | "fit" | "mrc",
-  settings: Settings
-): Promise<{ content: string | Uint8Array; filename: string } | null> {
-  const safeName = sanitizeFilename(workout.name);
-
-  try {
-    switch (format) {
-      case "zwo": {
-        if (!isZwoSupported(workout.sport)) return null;
-        const content = generateZwo(workout, settings);
-        return { content, filename: `${safeName}.zwo` };
-      }
-      case "fit": {
-        if (!isFitSupported(workout.sport)) return null;
-        const content = await generateFit(workout, settings);
-        return { content, filename: `${safeName}.fit` };
-      }
-      case "mrc": {
-        if (!isErgSupported(workout.sport)) return null;
-        const content = generateMrc(workout, settings);
-        return { content, filename: `${safeName}.mrc` };
-      }
-      default:
-        return null;
-    }
-  } catch {
-    return null;
-  }
-}
-
-/**
- * Export all workouts in the plan to a single ZIP file
- * Contains ZWO/FIT/MRC files based on the selected format
+ * Export supported workouts as a lossless ZIP. The archive builder distinguishes
+ * unsupported workouts from conversion failures and allocates unique filenames.
  */
 export async function exportAllWorkouts(
   plan: TrainingPlan,
-  format: "zwo" | "fit" | "mrc",
+  format: WorkoutExportFormat,
   settings: Settings
 ): Promise<{ exported: number; skipped: number; errors: string[] }> {
-  const errors: string[] = [];
-  let exported = 0;
-  let skipped = 0;
-
-  const zip = new JSZip();
-
-  for (const week of plan.weeks ?? []) {
-    for (const day of week.days ?? []) {
-      for (const workout of day.workouts ?? []) {
-        // Skip rest days
-        if (workout.sport === "rest") {
-          skipped++;
-          continue;
-        }
-
-        // Check format support
-        if (format === "zwo" && !isZwoSupported(workout.sport)) {
-          skipped++;
-          continue;
-        }
-        if (format === "fit" && !isFitSupported(workout.sport)) {
-          skipped++;
-          continue;
-        }
-        if (format === "mrc" && !isErgSupported(workout.sport)) {
-          skipped++;
-          continue;
-        }
-
-        try {
-          const result = await generateWorkoutContent(workout, format, settings);
-          if (result) {
-            zip.file(result.filename, result.content);
-            exported++;
-          } else {
-            skipped++;
-          }
-        } catch (error) {
-          errors.push(
-            `${workout.name}: ${error instanceof Error ? error.message : "Unknown error"}`
-          );
-        }
-      }
+  try {
+    const result = await buildWorkoutArchive(plan, format, settings);
+    if (result.content) {
+      const planName = sanitizeFilename(plan.meta.event) || "Training_Plan";
+      downloadFile(result.content, planName + "_workouts_" + format + ".zip", "application/zip");
     }
+    return { exported: result.exported, skipped: result.skipped, errors: result.errors };
+  } catch (error) {
+    const reason = error instanceof Error ? error.message : String(error);
+    return { exported: 0, skipped: 0, errors: ["Could not create workout ZIP: " + reason] };
   }
-
-  // Only create and download the ZIP if there are files to export
-  if (exported > 0) {
-    const zipContent = await zip.generateAsync({ type: "uint8array" });
-    const planName = sanitizeFilename(plan.meta.event);
-    const zipFilename = `${planName}_workouts_${format}.zip`;
-    downloadFile(zipContent, zipFilename, "application/zip");
-  }
-
-  return { exported, skipped, errors };
 }
 
 // Re-export format-specific helpers
 export { isZwoSupported } from "./zwo.js";
 export { isFitSupported, isFitSdkAvailable } from "./fit.js";
 export { isErgSupported } from "./erg.js";
+export { sanitizeFilename } from "./filename.js";
